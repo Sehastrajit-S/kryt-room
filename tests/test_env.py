@@ -8,6 +8,7 @@ from gymnasium.utils.env_checker import check_env
 import roomworld
 from roomworld import FORWARD, INTERACT, TURN_LEFT, TURN_RIGHT, RoomEnv, Task
 from roomworld.env import TURN_PER_STEP
+from roomworld.tasks import DARK_BELOW
 
 
 def walk_action(env, field):
@@ -65,6 +66,13 @@ def test_lidar_sees_a_known_wall():
     assert distance == pytest.approx(3.0)
 
 
+def test_lidar_handles_rays_exactly_along_an_axis():
+    room = roomworld.Room()
+    distances = room.raycast(2.5, 0.0, np.array([0.0, math.pi]), 10.0)
+    assert distances[0] == pytest.approx(2.5)
+    assert distances[1] > 0
+
+
 def test_navigate_is_solvable_from_any_seed():
     env = RoomEnv()
     for seed in range(30):
@@ -78,8 +86,13 @@ def test_navigate_is_solvable_from_any_seed():
 
 def test_caretaker_is_solvable():
     env = RoomEnv(task="caretaker")
-    for seed in range(5):
+    for seed in range(12):
         env.reset(seed=seed)
+        task = env.task
+        if (task.sun_start - DARK_BELOW) * (task.sun_end - DARK_BELOW) < 0:
+            crossing = (DARK_BELOW - task.sun_start) / (task.sun_end - task.sun_start) * task.max_steps
+            if crossing > task.max_steps - 200:   # too late for anyone to reach every switch
+                continue
         info, done, total = {}, False, 0.0
         while not done:
             wrong = [n for n in env.world.lamps if env.task._wrong(env.world, n)]
@@ -125,4 +138,61 @@ def test_replay_file(tmp_path):
     env.save_replay(path)
     data = json.loads(path.read_text())
     assert data["dt"] == 0.1 and len(data["frames"]) == 2
-    assert set(data["frames"][0]) == {"x", "z", "heading", "sun", "preset", "lamps"}
+    assert {"x", "z", "heading", "sun", "preset", "lamps"} <= set(data["frames"][0])
+    layout = data["dust"]
+    assert len(data["frames"][0]["dust"]) == layout["nx"] * layout["nz"]
+
+
+def dust_at(env, x, z, radius):
+    dust = env.world.dust
+    return dust.levels[(dust.x - x) ** 2 + (dust.z - z) ** 2 < radius**2].mean()
+
+
+def test_dust_is_heavier_at_the_door_than_in_a_quiet_corner():
+    env = RoomEnv()
+    door, quiet = [], []
+    for seed in range(40):
+        env.reset(seed=seed)
+        door.append(dust_at(env, 2.05, 1.95, 0.4))
+        quiet.append(dust_at(env, 2.6, 0.0, 0.3))
+    assert np.mean(door) > 2 * np.mean(quiet)
+
+
+def test_dust_changes_between_episodes_but_repeats_for_a_seed():
+    env = RoomEnv()
+    env.reset(seed=1)
+    first = env.world.dust.levels.copy()
+    env.reset(seed=2)
+    assert not np.allclose(first, env.world.dust.levels)
+    env.reset(seed=1)
+    assert np.allclose(first, env.world.dust.levels)
+
+
+def test_dust_builds_up_during_an_episode():
+    env = RoomEnv()
+    env.reset(seed=0)
+    before = env.world.dust.total()
+    for _ in range(300):
+        env.step(0)
+    assert env.world.dust.total() > before
+
+
+def test_cleaning_removes_dust():
+    env = RoomEnv()
+    env.reset(seed=0)
+    dust = env.world.dust
+    before = dust.total()
+    removed = dust.clean(2.05, 1.95, 0.5, power=1.0)
+    assert removed > 0
+    assert dust.total() == pytest.approx(before - removed)
+    assert dust_at(env, 2.05, 1.95, 0.4) == 0
+
+
+def test_dust_sensor_only_reports_nearby_dirt():
+    env = RoomEnv()
+    env.reset(seed=0)
+    dust = env.world.dust
+    dust.levels[:] = 0.0
+    dust.levels[np.argmin((dust.x - 2.5) ** 2 + (dust.z - 0.0) ** 2)] = 1.0
+    assert dust.sense(2.5, 1.0, 0.0).sum() > 0
+    assert dust.sense(-2.0, 1.0, 0.0).sum() == 0

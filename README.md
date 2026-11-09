@@ -34,7 +34,7 @@ while not done:
 
 ## The environment
 
-The agent is a round body, 0.24 m in radius, on a 6 x 5 m floor with furniture. Each step is 0.1 seconds.
+The agent is a round body, 0.24 m in radius, on a 6 x 5 m floor with furniture and a charging dock (the named place `dock`). Each step is 0.1 seconds.
 
 | Action | Effect |
 |---|---|
@@ -55,6 +55,39 @@ Observations are a flat vector, with every value in `[-1, 1]`:
 | varies | Whatever the task adds |
 
 `info["state"]` holds the world as readable values (position, heading, daylight, lamps), which is handy for agents that work from text.
+
+## Dust
+
+The floor gets dirty the way a lived-in room does, and it keeps changing during an episode. Dust isn't part of the base observation, so tasks choose how much of it an agent can sense. Each 25 cm square has a level from 0 to 1, built from:
+
+| Source | Where it lands |
+|---|---|
+| Foot traffic | Along walking routes between the door, desk, table and window |
+| Entrance | Just inside the door |
+| Crumbs | Around the coffee table, on some days |
+| Desk chair | In front of the desk chair, on most days |
+| Plant soil | Next to the plant pot, on some days |
+| Window sill | A strip below the window |
+| Edges | Along walls and furniture |
+| Rug | Holds on to more of whatever lands on it |
+
+Each episode is a new day: how busy it was, which routes were used and where the clumps fall all vary. While the episode runs, dust keeps settling, and someone may walk through or something may spill. Seeds make all of this repeatable.
+
+Tasks reach it through `world.dust`:
+
+```python
+from roomworld import RoomEnv
+
+env = RoomEnv()
+env.reset(seed=0)
+dust = env.world.dust
+
+removed = dust.clean(x=2.0, z=1.9, radius=0.22)          # lift dirt, returns how much
+nearby = dust.sense(x=2.0, z=1.9, heading=0.0)           # dirt in 8 directions within 1.5 m
+remaining = dust.total()
+```
+
+The sources and rates are all in the `dust` section of `world/room.json`. Recorded replays include the dust, so you can see it in the 3D view.
 
 ## Tasks
 
@@ -102,7 +135,7 @@ model = PPO("MlpPolicy", env, n_steps=512, batch_size=512, n_epochs=6, gamma=0.9
 model.learn(total_timesteps=500_000)
 ```
 
-As a reference point, these untuned settings raised the Navigate success rate from 10% (random actions) to 49% after 500,000 steps, about two minutes on a CPU. There's plenty of room to beat that. Stable-Baselines3 prints a `render_mode` warning, which is safe to ignore.
+As a reference point, one run with these untuned settings reached a 53% Navigate success rate after 300,000 steps and 42% by 500,000, about two and a half minutes on a CPU. Random actions score 4%. There's plenty of room to beat that. Stable-Baselines3 prints a `render_mode` warning, which is safe to ignore.
 
 ## Watch an episode in 3D
 

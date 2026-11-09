@@ -305,6 +305,14 @@ for (let i = 0; i < 26; i++) {
   leaf.rotation.set(0, -a, 0.35 - rand() * 0.6);
 }
 
+// charging dock against the north wall
+const dockPlastic = std(0x24262a, 0.38, 0.1);
+box(0.46, 0.008, 0.34, 2.5, 0.004, -2.16, std(0x1b1c1f, 0.7));
+soft(0.38, 0.14, 0.16, 0.035, 2.5, 0.08, -2.4, dockPlastic);
+box(0.22, 0.03, 0.006, 2.5, 0.075, -2.318, std(0x0d1014, 0.15));
+for (const x of [2.42, 2.58]) box(0.05, 0.004, 0.09, x, 0.01, -2.27, brass, { cast: false });
+add(new THREE.SphereGeometry(0.009, 12, 8), std(0x000000, 0.4, 0, { emissive: 0x58e08a, emissiveIntensity: 5 }), 2.5, 0.15, -2.36, { cast: false });
+
 // curtains and rod
 tag('west');
 const curtainMat = std(0xd9cdb8, 0.95, 0, { side: THREE.DoubleSide });
@@ -456,6 +464,7 @@ function bakeBounce() {
   renderer.shadowMap.needsUpdate = true;
   pane.visible = false;
   if (body) body.root.visible = false;
+  if (dustLayer) dustLayer.mesh.visible = false;
   scene.background = null;
   emitters.forEach(e => (e.mesh.visible = false));
   scene.environment = null;
@@ -468,6 +477,7 @@ function bakeBounce() {
   }
   pane.visible = true;
   if (body) body.root.visible = true;
+  if (dustLayer) dustLayer.mesh.visible = true;
   scene.background = backdrop;
   emitters.forEach(e => (e.mesh.visible = true));
 }
@@ -498,7 +508,46 @@ const room = await (await fetch('room.json')).json();
 // Anything placed in the room provides { root, update(dt), afterRender?() }. It stays out of the room's own lighting.
 let body = null;
 
-function createReplayBody({ dt, frames }) {
+// Dust from the simulation, one square of the floor per pixel. Created when an episode brings dust data.
+let dustLayer = null;
+function showDust({ nx, nz }) {
+  if (dustLayer) return dustLayer;
+  const canvas = document.createElement('canvas');
+  canvas.width = nx;
+  canvas.height = nz;
+  const g = canvas.getContext('2d');
+  const image = g.createImageData(nx, nz);
+  for (let i = 0; i < image.data.length; i += 4) image.data.set([226, 216, 196, 0], i);
+  const map = new THREE.CanvasTexture(canvas);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.magFilter = THREE.LinearFilter;
+  const grain = canvasTexture(256, 256, (c, W, H) => {
+    const noise = c.createImageData(W, H);
+    for (let i = 0; i < noise.data.length; i += 4) {
+      const v = 120 + Math.random() * 135;
+      noise.data.set([v, v, v, 255], i);
+    }
+    c.putImageData(noise, 0, 0);
+  }, false);
+  grain.wrapS = grain.wrapT = THREE.RepeatWrapping;
+  grain.repeat.set(room.floor.halfX * 3, room.floor.halfZ * 3);
+  const mesh = add(new THREE.PlaneGeometry(room.floor.halfX * 2, room.floor.halfZ * 2),
+    new THREE.MeshStandardMaterial({ map, alphaMap: grain, transparent: true, depthWrite: false, roughness: 1 }),
+    0, 0.016, 0, { cast: false });
+  mesh.rotation.x = -Math.PI / 2;
+  dustLayer = {
+    mesh,
+    set(code) {
+      for (let i = 0; i < code.length; i++) image.data[i * 4 + 3] = Math.min(255, (code.charCodeAt(i) - 48) * 34);
+      g.putImageData(image, 0, 0);
+      map.needsUpdate = true;
+    },
+  };
+  return dustLayer;
+}
+
+function createReplayBody({ dt, frames, dust }) {
+  const layer = dust ? showDust(dust) : null;
   const root = new THREE.Group();
   const puck = std(0xd9682f, 0.45);
   cyl(0.2, 0.22, 0.14, 0, 0.07, 0, puck, { cast: false, parent: root });
@@ -512,6 +561,7 @@ function createReplayBody({ dt, frames }) {
       const i = Math.min(Math.floor(time / dt), frames.length - 2), f = time / dt - i;
       const a = frames[i], b = frames[i + 1];
       root.position.set(a.x + (b.x - a.x) * f, 0, a.z + (b.z - a.z) * f);
+      for (let k = i; layer && k >= 0 && k > i - 8; k--) if (frames[k].dust) { layer.set(frames[k].dust); break; }
       root.rotation.y = a.heading + Math.atan2(Math.sin(b.heading - a.heading), Math.cos(b.heading - a.heading)) * f;
       if (a.preset !== state.preset || Object.keys(a.lamps).some(name => a.lamps[name] !== state.lamps[name])) {
         state.preset = a.preset;
@@ -596,7 +646,7 @@ if (params.get('replay')) {
   const url = new URL(params.get('agent'), location.href);
   if (url.origin !== location.origin) throw new Error('Agent plugins must be served from this site.');
   const plugin = await import(url.href);
-  body = await plugin.default({ THREE, RoundedBoxGeometry, scene, camera, room });
+  body = await plugin.default({ THREE, RoundedBoxGeometry, scene, camera, room, showDust });
 }
 if (body) {
   scene.add(body.root);

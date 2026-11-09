@@ -8,6 +8,7 @@
     "bookshelf":     [-2.12, -1.08, -2.5, -2.16],
     "plant":         [-2.65, -2.15, -2.05, -1.55],
     "floor_lamp":    [1.62, 1.98, -2.28, -1.92],
+    "charging_dock": [2.31, 2.69, -2.5, -2.32],
     "curtain_north": [-3, -2.75, -2.05, -1.2],
     "curtain_south": [-3, -2.75, 1.2, 2.05]
   },
@@ -17,12 +18,41 @@
     "lamp":   { "x": 1.8,   "z": -1.4,  "face": 3.14159265,  "label": "floor lamp" },
     "table":  { "x": 0.2,   "z": -0.1,  "face": 3.14159265,  "label": "coffee table" },
     "desk":   { "x": 0.15,  "z": 2.1,   "face": -1.57079633, "label": "desk" },
-    "door":   { "x": 2.05,  "z": 1.95,  "face": 0,           "label": "door" }
+    "door":   { "x": 2.05,  "z": 1.95,  "face": 0,           "label": "door" },
+    "dock":   { "x": 2.5,   "z": -2.06, "face": 0,           "label": "charging dock" }
   },
   "lamps": {
     "floor":   { "x": 1.8,  "z": -1.4 },
     "desk":    { "x": 0.15, "z": 2.1 },
     "ceiling": { "x": 2.05, "z": 1.95 }
   },
-  "switchReach": 0.45
+  "switchReach": 0.45,
+  "dust": {
+    "background": 0.02,
+    "noise": 0.02,
+    "busy_day_range": [0.6, 1.3],
+    "settle_per_minute": 0.03,
+    "events_per_minute": 1.2,
+    "edges": { "strength": 0.12, "width": 0.15 },
+    "traffic": {
+      "strength": 0.4,
+      "width": 0.25,
+      "chance": 0.7,
+      "routes": [
+        [[2.05, 1.95], [1.1, 0.7], [0.2, -0.1]],
+        [[2.05, 1.95], [0.15, 2.1]],
+        [[2.05, 1.95], [0.4, 0.75], [-2.25, 0.0]],
+        [[0.15, 2.1], [-0.1, 1.0], [-2.25, 0.0]],
+        [[0.2, -0.1], [-2.25, 0.0]]
+      ]
+    },
+    "sources": [
+      { "name": "entrance",    "x": 2.05,  "z": 1.95,  "strength": 0.6,  "radius": 0.8,  "jitter": 0.15 },
+      { "name": "crumbs",      "x": 0.2,   "z": -0.3,  "strength": 0.7,  "radius": 0.5,  "jitter": 0.25, "chance": 0.6 },
+      { "name": "desk_chair",  "x": -1.0,  "z": 0.95,  "strength": 0.45, "radius": 0.45, "jitter": 0.15, "chance": 0.8 },
+      { "name": "plant_soil",  "x": -2.4,  "z": -1.3,  "strength": 0.5,  "radius": 0.35, "jitter": 0.08, "chance": 0.5 },
+      { "name": "window_sill", "from": [-2.55, -1.1], "to": [-2.55, 1.1], "strength": 0.3, "width": 0.35 }
+    ],
+    "retain": [{ "name": "rug", "rect": [-1.3, 1.7, -2.1, 0.1], "factor": 1.4 }]
+  }
 }

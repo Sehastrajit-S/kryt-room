@@ -9,6 +9,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 
+from .dust import Dust
 from .room import Room
 from .tasks import TASKS, Task
 
@@ -17,6 +18,7 @@ STEP_SECONDS = 0.1
 MOVE_PER_STEP = 0.06
 TURN_PER_STEP = 0.25
 LIDAR_RANGE = 3.0
+DUST_FRAME_EVERY = 5
 
 
 @dataclass
@@ -26,6 +28,7 @@ class World:
     heading: float = 0.0
     sun: float = 1.0
     lamps: dict = field(default_factory=dict)
+    dust: Dust | None = None
 
 
 class RoomEnv(gym.Env):
@@ -38,7 +41,7 @@ class RoomEnv(gym.Env):
         self.room = room or Room()
         self.record = record
         self.lidar_angles = np.arange(lidar_rays) * (2 * math.pi / lidar_rays)
-        self.world = World(lamps={name: False for name in self.room.lamps})
+        self.world = World(lamps={name: False for name in self.room.lamps}, dust=Dust(self.room))
         self.frames: list[dict] = []
         self._spawn_points = self.room.walkable_points()
         self._steps = 0
@@ -59,6 +62,12 @@ class RoomEnv(gym.Env):
         preset = "day" if w.sun > 0.6 else "golden" if w.sun > 0.25 else "night"
         return {"x": w.x, "z": w.z, "heading": w.heading, "sun": w.sun, "preset": preset, "lamps": dict(w.lamps)}
 
+    def _frame(self) -> dict:
+        frame = self._snapshot()
+        if self._steps % DUST_FRAME_EVERY == 0:
+            frame["dust"] = self.world.dust.encode()
+        return frame
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         w = self.world
@@ -68,8 +77,9 @@ class RoomEnv(gym.Env):
         for name in w.lamps:
             w.lamps[name] = False
         self._steps = 0
+        w.dust.reset(self.np_random)
         self.task.reset(w, self.room, self.np_random)
-        self.frames = [self._snapshot()] if self.record else []
+        self.frames = [self._frame()] if self.record else []
         return self._observation(), {"state": self._snapshot()}
 
     def step(self, action):
@@ -94,12 +104,13 @@ class RoomEnv(gym.Env):
                 w.lamps[name] = not w.lamps[name]
                 events["toggled"] = name
         w.heading = math.atan2(math.sin(w.heading), math.cos(w.heading))
+        w.dust.step(STEP_SECONDS, self.np_random)
 
         reward, terminated, info = self.task.reward(w, self.room, events)
         self._steps += 1
         truncated = self._steps >= self.task.max_steps and not terminated
         if self.record:
-            self.frames.append(self._snapshot())
+            self.frames.append(self._frame())
         return self._observation(), float(reward), bool(terminated), truncated, {**info, "state": self._snapshot()}
 
     def save_replay(self, path: str | Path) -> None:
@@ -108,4 +119,4 @@ class RoomEnv(gym.Env):
             raise RuntimeError("Create the environment with record=True to save replays.")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"dt": STEP_SECONDS, "frames": self.frames}), encoding="utf-8")
+        path.write_text(json.dumps({"dt": STEP_SECONDS, "dust": self.world.dust.layout(), "frames": self.frames}), encoding="utf-8")

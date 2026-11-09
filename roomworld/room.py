@@ -41,6 +41,7 @@ class Room:
         self.places = data["places"]
         self.lamps = data["lamps"]
         self.switch_reach = float(data["switchReach"])
+        self.dust_config = data["dust"]
         self.radius = radius
         self._nx = round(self.half_x * 2 / CELL) + 1
         self._nz = round(self.half_z * 2 / CELL) + 1
@@ -98,9 +99,9 @@ class Room:
         """Distance along each heading to the nearest wall or piece of furniture."""
         dx, dz = np.sin(angles), np.cos(angles)
         with np.errstate(divide="ignore", invalid="ignore"):
-            wall_x = np.where(dx > 0, (self.half_x - x) / dx, (-self.half_x - x) / dx)
-            wall_z = np.where(dz > 0, (self.half_z - z) / dz, (-self.half_z - z) / dz)
-            distances = np.minimum(np.nan_to_num(wall_x, nan=np.inf), np.nan_to_num(wall_z, nan=np.inf))
+            wall_x = np.where(dx > 0, (self.half_x - x) / dx, np.where(dx < 0, (-self.half_x - x) / dx, np.inf))
+            wall_z = np.where(dz > 0, (self.half_z - z) / dz, np.where(dz < 0, (-self.half_z - z) / dz, np.inf))
+            distances = np.minimum(wall_x, wall_z)
 
             o = self.obstacles
             tx0 = (o[:, 0, None] - x) / dx[None, :]
