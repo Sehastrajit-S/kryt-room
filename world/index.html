@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lit Room</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c0b0a; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #ui {
+    position: fixed; left: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 10px 14px; border-radius: 10px; color: #eee7dc; background: rgba(20, 17, 14, .62);
+    backdrop-filter: blur(10px); font: 13px/1.2 system-ui, sans-serif; max-width: calc(100vw - 60px);
+  }
+  #ui button {
+    font: inherit; color: inherit; background: none; border: 0; padding: 6px 10px; border-radius: 6px; cursor: pointer;
+  }
+  #ui button.on { background: #eee7dc; color: #1a1612; }
+  #ui label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
+  #ui input { accent-color: #e8b472; margin: 0; }
+  #ui .group { display: flex; gap: 10px; align-items: center; }
+  #hint { opacity: .65; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div class="group" id="presets">
+    <button data-p="day">Day</button>
+    <button data-p="golden">Golden hour</button>
+    <button data-p="night">Night</button>
+  </div>
+  <div class="group">
+    <label><input type="checkbox" data-l="ceiling">Ceiling</label>
+    <label><input type="checkbox" data-l="floor">Floor lamp</label>
+    <label><input type="checkbox" data-l="desk">Desk lamp</label>
+  </div>
+  <span id="hint">Drag to orbit · Scroll to zoom</span>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ---------- renderer ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+const pixelRatio = Math.min(devicePixelRatio, 2);
+renderer.setPixelRatio(pixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;   // honours light.shadow.radius, unlike PCFSoft
+renderer.shadowMap.autoUpdate = false;          // the scene is static: shadows re-render only on change
+document.body.prepend(renderer.domElement);
+RectAreaLightUniformsLib.init();
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 200);
+
+/* ---------- helpers ---------- */
+function mulberry(seed) {
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry(7);
+const std = (color, roughness = 0.8, metalness = 0, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color, roughness, metalness, ...extra });
+
+// Walls the camera is outside of are cut away. They only leave the main camera's layer,
+// so they still block light and contribute bounce.
+const CUTAWAY_LAYER = 1;
+const cutaway = { ceiling: [], north: [], south: [], east: [], west: [] };
+let currentWall = null;
+const tag = wall => (currentWall = wall);
+
+function add(geometry, material, x, y, z, { cast = true, receive = true, parent = scene } = {}) {
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = cast;
+  mesh.receiveShadow = receive;
+  parent.add(mesh);
+  if (currentWall) cutaway[currentWall].push(mesh);
+  return mesh;
+}
+const box = (w, h, d, x, y, z, mat, opts) => add(new THREE.BoxGeometry(w, h, d), mat, x, y, z, opts);
+const soft = (w, h, d, r, x, y, z, mat, opts) => add(new RoundedBoxGeometry(w, h, d, 4, r), mat, x, y, z, opts);
+const cyl = (rt, rb, h, x, y, z, mat, opts) => add(new THREE.CylinderGeometry(rt, rb, h, 32), mat, x, y, z, opts);
+
+function canvasTexture(w, h, draw, srgb = true) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+/* ---------- room shell (x: -3..3, y: 0..2.8, z: -2.5..2.5) ---------- */
+const WIN = { z0: -1.2, z1: 1.2, y0: 0.7, y1: 2.3 };
+const plaster = std(0xe6dfd3, 0.92);
+const ceilingMat = std(0xf2eee7, 0.95);
+const trim = std(0xf4f1ea, 0.45);
+
+tag('ceiling');
+box(6.4, 0.2, 5.4, 0, 2.9, 0, ceilingMat);
+tag(null);
+box(6.4, 0.2, 5.4, 0, -0.11, 0, std(0x3a2a1c, 0.8));
+tag('north');
+box(6.4, 2.8, 0.2, 0, 1.4, -2.6, plaster);
+box(6, 0.11, 0.016, 0, 0.055, -2.492, trim);
+tag('south');
+box(6.4, 2.8, 0.2, 0, 1.4, 2.6, plaster);
+box(6, 0.11, 0.016, 0, 0.055, 2.492, trim);
+// door
+box(1.02, 2.1, 0.03, 2.05, 1.05, 2.485, std(0xddd7cc, 0.5));
+box(0.07, 2.14, 0.04, 1.5, 1.07, 2.48, trim);
+box(0.07, 2.14, 0.04, 2.6, 1.07, 2.48, trim);
+box(1.17, 0.07, 0.04, 2.05, 2.16, 2.48, trim);
+add(new THREE.SphereGeometry(0.03, 20, 14), std(0x9a8a68, 0.3, 1), 1.68, 1.0, 2.44);
+tag('east');
+box(0.2, 2.8, 5.4, 3.1, 1.4, 0, plaster);
+box(0.016, 0.11, 5, 2.992, 0.055, 0, trim);
+
+tag('west');
+// west wall is one solid with a real opening, so the sun can only enter through it
+const westShape = new THREE.Shape([[-2.7, 0], [2.7, 0], [2.7, 2.8], [-2.7, 2.8]].map(([u, v]) => new THREE.Vector2(u, v)));
+westShape.holes.push(new THREE.Path([[WIN.z0, WIN.y0], [WIN.z1, WIN.y0], [WIN.z1, WIN.y1], [WIN.z0, WIN.y1]].map(([u, v]) => new THREE.Vector2(u, v))));
+add(new THREE.ExtrudeGeometry(westShape, { depth: 0.2, bevelEnabled: false }), plaster, -3.2, 0, 0).rotation.y = Math.PI / 2;
+box(0.016, 0.11, 5, -2.992, 0.055, 0, trim);
+
+// window frame, mullions and sill
+const winMidY = (WIN.y0 + WIN.y1) / 2, winH = WIN.y1 - WIN.y0, winW = WIN.z1 - WIN.z0;
+box(0.14, 0.06, winW, -3.1, WIN.y1 - 0.03, 0, trim);
+box(0.14, 0.06, winW, -3.1, WIN.y0 + 0.03, 0, trim);
+box(0.14, winH, 0.06, -3.1, winMidY, WIN.z0 + 0.03, trim);
+box(0.14, winH, 0.06, -3.1, winMidY, WIN.z1 - 0.03, trim);
+box(0.1, winH, 0.04, -3.1, winMidY, 0, trim);
+box(0.1, 0.04, winW, -3.1, 1.75, 0, trim);
+box(0.2, 0.03, winW + 0.16, -2.95, WIN.y0 - 0.015, 0, trim);
+// glowing sky behind the glass, visible from inside only
+const pane = add(new THREE.PlaneGeometry(winW, winH), new THREE.MeshBasicMaterial(), -3.13, winMidY, 0, { cast: false, receive: false });
+pane.rotation.y = Math.PI / 2;
+tag(null);
+
+/* ---------- procedural surfaces ---------- */
+const FLOOR = { w: 2048, h: 1707, plank: 61 };   // ~340 px/m across the 6 x 5 m floor
+const floorRows = [];
+for (let row = 0; row * FLOOR.plank < FLOOR.h; row++) {
+  const cuts = [];
+  for (let x = -rand() * 500; x < FLOOR.w; x += 420 + rand() * 480) cuts.push(x);
+  floorRows.push(cuts);
+}
+const floorMap = canvasTexture(FLOOR.w, FLOOR.h, (g, W) => {
+  floorRows.forEach((cuts, row) => {
+    const y = row * FLOOR.plank;
+    cuts.forEach((x, i) => {
+      const end = cuts[i + 1] ?? W;
+      g.fillStyle = `hsl(${28 + rand() * 7}, ${34 + rand() * 8}%, ${29 + rand() * 10}%)`;
+      g.fillRect(x, y, end - x, FLOOR.plank);
+      for (let n = 0; n < 14; n++) {
+        g.strokeStyle = `rgba(35, 20, 8, ${0.05 + rand() * 0.12})`;
+        g.lineWidth = 0.6 + rand() * 1.6;
+        const ly = y + rand() * FLOOR.plank;
+        g.beginPath();
+        g.moveTo(x, ly);
+        g.bezierCurveTo(x + (end - x) * 0.3, ly + rand() * 8 - 4, x + (end - x) * 0.7, ly + rand() * 8 - 4, end, ly + rand() * 6 - 3);
+        g.stroke();
+      }
+    });
+  });
+});
+const floorBump = canvasTexture(FLOOR.w, FLOOR.h, (g, W, H) => {
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, W, H);
+  g.fillStyle = '#000';
+  floorRows.forEach((cuts, row) => {
+    const y = row * FLOOR.plank;
+    g.fillRect(0, y, W, 1.5);
+    cuts.forEach(x => g.fillRect(x, y, 1.5, FLOOR.plank));
+  });
+}, false);
+const floor = add(new THREE.PlaneGeometry(6, 5), std(0xffffff, 0.4, 0, { map: floorMap, bumpMap: floorBump, bumpScale: 0.6 }), 0, 0, 0, { cast: false });
+floor.rotation.x = -Math.PI / 2;
+
+const rugMap = canvasTexture(1024, 750, (g, W, H) => {
+  g.fillStyle = '#7b3f32'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = '#d9c7a8'; g.lineWidth = 10; g.strokeRect(34, 34, W - 68, H - 68);
+  g.strokeStyle = '#2f3b47'; g.lineWidth = 22; g.strokeRect(70, 70, W - 140, H - 140);
+  for (let y = 150; y < H - 110; y += 94) for (let x = 150; x < W - 110; x += 94) {
+    g.save(); g.translate(x, y); g.rotate(Math.PI / 4);
+    g.fillStyle = (x + y) % 188 ? '#d9c7a8' : '#2f3b47';
+    g.fillRect(-20, -20, 40, 40); g.restore();
+  }
+  for (let i = 0; i < 26000; i++) {
+    g.fillStyle = `rgba(${rand() > .5 ? '255,240,220' : '20,10,5'}, ${rand() * .08})`;
+    g.fillRect(rand() * W, rand() * H, 2, 2);
+  }
+});
+box(3.0, 0.014, 2.2, 0.2, 0.007, -1.0, std(0xffffff, 0.98, 0, { map: rugMap }), { cast: false });
+
+/* ---------- furniture ---------- */
+const oak = std(0x8a5f3a, 0.42);
+const darkMetal = std(0x26262a, 0.42, 0.9);
+const brass = std(0xb08d57, 0.32, 1);
+
+// sofa
+const fabric = std(0x4e6470, 0.95);
+const fabricLight = std(0x597280, 0.95);
+soft(2.2, 0.28, 0.92, 0.05, 0.2, 0.28, -2.0, fabric);
+soft(2.2, 0.56, 0.2, 0.08, 0.2, 0.68, -2.36, fabric);
+soft(0.2, 0.46, 0.92, 0.08, -0.9, 0.46, -2.0, fabric);
+soft(0.2, 0.46, 0.92, 0.08, 1.3, 0.46, -2.0, fabric);
+for (const x of [-0.42, 0.2, 0.82]) {
+  soft(0.6, 0.16, 0.7, 0.07, x, 0.5, -1.92, fabricLight);
+  soft(0.58, 0.42, 0.15, 0.07, x, 0.78, -2.2, fabricLight);
+}
+soft(0.42, 0.42, 0.13, 0.06, -0.62, 0.79, -2.03, std(0xc98a3f, 0.95)).rotation.set(-0.3, 0.3, 0.12);
+for (const x of [-0.92, 1.32]) for (const z of [-2.38, -1.62]) cyl(0.022, 0.016, 0.14, x, 0.07, z, darkMetal);
+
+// coffee table with books and a bowl
+box(1.1, 0.04, 0.6, 0.2, 0.4, -0.75, oak);
+for (const x of [-0.28, 0.68]) for (const z of [-0.98, -0.52]) cyl(0.018, 0.014, 0.38, x, 0.19, z, darkMetal);
+box(0.3, 0.035, 0.22, -0.05, 0.438, -0.72, std(0x8c3b32, 0.6)).rotation.y = 0.2;
+box(0.26, 0.03, 0.19, -0.04, 0.47, -0.72, std(0xd8cdb8, 0.6)).rotation.y = -0.1;
+add(new THREE.SphereGeometry(0.11, 40, 20, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2), std(0xece6da, 0.18, 0, { side: THREE.DoubleSide }), 0.48, 0.53, -0.75);
+
+// desk
+box(1.5, 0.04, 0.7, -1.0, 0.72, 2.13, oak);
+box(0.04, 0.7, 0.66, -1.72, 0.35, 2.13, oak);
+box(0.04, 0.7, 0.66, -0.28, 0.35, 2.13, oak);
+box(1.4, 0.32, 0.02, -1.0, 0.54, 2.44, oak);
+box(0.32, 0.018, 0.23, -0.72, 0.749, 2.08, std(0x2c2c30, 0.4, 0.6)).rotation.y = -0.12;
+for (let i = 0; i < 4; i++) box(0.24, 0.03, 0.17, -1.0 + 0.45, 0.757 + i * 0.03, 2.3, std([0x35566b, 0xb6503c, 0xdccfae, 0x5d6b47][i], 0.65)).rotation.y = i * 0.1;
+cyl(0.04, 0.036, 0.09, -0.42, 0.785, 1.98, std(0xd9d2c5, 0.2));
+
+// chair
+const seatMat = std(0x2f2b28, 0.75);
+soft(0.44, 0.05, 0.44, 0.02, -1.0, 0.46, 1.5, seatMat);
+soft(0.42, 0.34, 0.04, 0.02, -1.0, 0.78, 1.28, seatMat);
+for (const x of [-1.19, -0.81]) for (const z of [1.31, 1.69]) cyl(0.014, 0.012, 0.44, x, 0.22, z, darkMetal);
+for (const x of [-1.19, -0.81]) cyl(0.012, 0.012, 0.32, x, 0.62, 1.29, darkMetal);
+
+// bookshelf on the north wall
+tag('north');
+const shelfX = -1.6, shelfZ = -2.34, shelfW = 1.0, shelfH = 2.1, shelfD = 0.32;
+box(0.03, shelfH, shelfD, shelfX - shelfW / 2, shelfH / 2, shelfZ, oak);
+box(0.03, shelfH, shelfD, shelfX + shelfW / 2, shelfH / 2, shelfZ, oak);
+box(shelfW, shelfH, 0.015, shelfX, shelfH / 2, -2.485, oak);
+const bookColors = [0x8c3b32, 0x35566b, 0xdccfae, 0x5d6b47, 0xb98a3c, 0x3a3a44, 0x9e6d57, 0xc4bfae];
+for (let s = 0; s < 6; s++) {
+  const y = 0.03 + s * 0.414;
+  box(shelfW - 0.03, 0.03, shelfD, shelfX, y, shelfZ, oak);
+  if (s === 5) continue;
+  let x = shelfX - shelfW / 2 + 0.05;
+  const stop = shelfX + shelfW / 2 - 0.05 - rand() * 0.2;
+  while (x < stop) {
+    const t = 0.024 + rand() * 0.035, h = 0.22 + rand() * 0.12, d = 0.17 + rand() * 0.07;
+    if (rand() > 0.9) { x += 0.1; continue; }
+    box(t, h, d, x + t / 2, y + 0.015 + h / 2, shelfZ - 0.03, std(bookColors[rand() * bookColors.length | 0], 0.7));
+    x += t + 0.002;
+  }
+}
+
+// painting above the sofa
+const art = canvasTexture(1000, 640, (g, W, H) => {
+  g.fillStyle = '#e4d9c3'; g.fillRect(0, 0, W, H);
+  [['#b6503c', 330, 300, 210], ['#35566b', 620, 370, 190], ['#d6a24a', 800, 180, 105]].forEach(([c, x, y, r]) => {
+    g.fillStyle = c; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
+  });
+  g.strokeStyle = '#1e1b18'; g.lineWidth = 5;
+  g.beginPath(); g.moveTo(70, 560); g.bezierCurveTo(330, 200, 620, 620, 930, 90); g.stroke();
+});
+box(1.3, 0.84, 0.03, 0.2, 1.72, -2.485, std(0x1f1b18, 0.5));
+add(new THREE.PlaneGeometry(1.2, 0.74), std(0xffffff, 0.75, 0, { map: art }), 0.2, 1.72, -2.468, { cast: false });
+tag(null);
+
+// plant
+const leafMat = std(0x3f6b3c, 0.5, 0, { side: THREE.DoubleSide });
+const plantZ = -1.8;
+cyl(0.2, 0.15, 0.36, -2.4, 0.18, plantZ, std(0xc0694a, 0.85));
+cyl(0.185, 0.185, 0.01, -2.4, 0.355, plantZ, std(0x241a12, 1));
+cyl(0.014, 0.022, 1.15, -2.4, 0.9, plantZ, std(0x4a3a26, 0.85));
+for (let i = 0; i < 26; i++) {
+  const a = i * 2.4, y = 0.75 + (i / 26) * 0.9, reach = 0.36 - (i / 26) * 0.14;
+  const leaf = add(new THREE.SphereGeometry(1, 12, 8), leafMat, -2.4 + Math.cos(a) * reach, y, plantZ + Math.sin(a) * reach);
+  leaf.scale.set(0.3, 0.012, 0.1);
+  leaf.rotation.set(0, -a, 0.35 - rand() * 0.6);
+}
+
+// curtains and rod
+tag('west');
+const curtainMat = std(0xd9cdb8, 0.95, 0, { side: THREE.DoubleSide });
+for (const z of [-1.62, 1.62]) {
+  const geo = new THREE.PlaneGeometry(0.62, 2.4, 96, 1);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setZ(i, Math.sin(p.getX(i) * 44) * 0.035);
+  geo.computeVertexNormals();
+  add(geo, curtainMat, -2.87, 1.27, z).rotation.y = Math.PI / 2;
+}
+cyl(0.014, 0.014, 4.1, -2.87, 2.49, 0, darkMetal).rotation.x = Math.PI / 2;
+tag(null);
+
+/* ---------- lights ---------- */
+function shadowed(light, size, radius, bias = -0.0006, normalBias = 0.015) {
+  light.castShadow = true;
+  light.shadow.mapSize.set(size, size);
+  light.shadow.radius = radius;
+  light.shadow.bias = bias;
+  light.shadow.normalBias = normalBias;
+  light.shadow.camera.near = 0.05;
+  return light;
+}
+const WARM = 0xffc58a;
+
+// key light: the sun, blocked by the walls and shaped by the window frame
+const sun = shadowed(new THREE.DirectionalLight(0xffffff, 1), 4096, 4, -0.0003, 0.02);
+Object.assign(sun.shadow.camera, { left: -4.4, right: 4.4, top: 4.4, bottom: -4.4, near: 1, far: 30 });
+scene.add(sun, sun.target);
+sun.target.position.set(0, 1.2, 0);
+
+// fill light: the whole sky acting as an area light in the window opening
+const skyLight = new THREE.RectAreaLight(0xffffff, 1, winW, winH);
+skyLight.position.set(-3.0, winMidY, 0);
+skyLight.lookAt(0, winMidY, 0);
+scene.add(skyLight);
+
+// emissive fixtures are hidden during the bounce capture so their light isn't counted twice
+const emitters = [];
+function emitter(mesh, group, strength) {
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  emitters.push({ mesh, group, strength });
+  return mesh;
+}
+const glow = () => new THREE.MeshStandardMaterial({ color: 0xe9e2d4, roughness: 0.8, emissive: WARM, side: THREE.DoubleSide });
+const fixtures = { ceiling: [], floor: [], desk: [] };
+function fixture(group, light, intensity) {
+  light.userData.on = intensity;
+  fixtures[group].push(light);
+  scene.add(light);
+  if (light.target) scene.add(light.target);
+  return light;
+}
+
+// ceiling pendant: frosted globe
+const pendantPos = new THREE.Vector3(0.2, 2.1, -0.75);
+tag('ceiling');
+cyl(0.05, 0.05, 0.02, pendantPos.x, 2.79, pendantPos.z, darkMetal, { cast: false });
+tag(null);
+cyl(0.004, 0.004, 0.55, pendantPos.x, 2.5, pendantPos.z, darkMetal, { cast: false });
+emitter(add(new THREE.SphereGeometry(0.14, 40, 24), glow(), pendantPos.x, pendantPos.y, pendantPos.z), 'ceiling', 5);
+const pendant = shadowed(new THREE.PointLight(WARM, 1, 0, 2), 1024, 4, -0.002, 0.03);
+pendant.position.copy(pendantPos);
+pendant.shadow.camera.far = 10;
+fixture('ceiling', pendant, 4.5);
+
+// floor lamp: a shade leaks light down, up, and softly through the fabric
+const lamp = { x: 1.8, z: -2.1, y: 1.6 };
+cyl(0.15, 0.16, 0.025, lamp.x, 0.0125, lamp.z, darkMetal);
+cyl(0.011, 0.011, lamp.y, lamp.x, lamp.y / 2, lamp.z, darkMetal);
+emitter(add(new THREE.CylinderGeometry(0.15, 0.21, 0.28, 40, 1, true), glow(), lamp.x, lamp.y, lamp.z), 'floor', 3.2);
+const lampDown = shadowed(new THREE.SpotLight(WARM, 1, 0, 1.08, 0.75, 2), 1024, 5);
+lampDown.position.set(lamp.x, lamp.y + 0.02, lamp.z);
+lampDown.target.position.set(lamp.x, 0, lamp.z);
+lampDown.shadow.camera.far = 8;
+fixture('floor', lampDown, 11);
+const lampUp = new THREE.SpotLight(WARM, 1, 0, 0.92, 0.75, 2);
+lampUp.position.set(lamp.x, lamp.y - 0.02, lamp.z);
+lampUp.target.position.set(lamp.x, 2.8, lamp.z);
+fixture('floor', lampUp, 7);
+const lampShade = new THREE.PointLight(WARM, 1, 0, 2);
+lampShade.position.set(lamp.x, lamp.y, lamp.z);
+fixture('floor', lampShade, 1.1);
+
+// desk lamp: tight task light
+const desk = { x: -1.5, z: 2.2 };
+cyl(0.08, 0.09, 0.02, desk.x, 0.75, desk.z, brass);
+cyl(0.009, 0.009, 0.42, desk.x, 0.96, desk.z, brass);
+cyl(0.05, 0.1, 0.13, desk.x, 1.22, desk.z, brass, { cast: false });
+emitter(cyl(0.08, 0.08, 0.004, desk.x, 1.155, desk.z, glow()), 'desk', 6);
+const deskSpot = shadowed(new THREE.SpotLight(WARM, 1, 0, 0.85, 0.7, 2), 1024, 3.5);
+deskSpot.position.set(desk.x, 1.17, desk.z);
+deskSpot.target.position.set(desk.x + 0.1, 0.74, desk.z - 0.1);
+deskSpot.shadow.camera.far = 4;
+fixture('desk', deskSpot, 3.2);
+
+/* ---------- lighting states ---------- */
+const col = a => new THREE.Color(a[0], a[1], a[2]);
+const PRESETS = {
+  day: {
+    dir: [-0.62, 0.72, 0.34], sun: [1, 0.94, 0.84], sunI: 16,
+    sky: [0.72, 0.85, 1], skyI: 6, exposure: 1.0,
+    pane: [2.4, 2.9, 3.4], backdrop: [0.3, 0.31, 0.33],
+    lamps: { ceiling: false, floor: false, desk: false },
+  },
+  golden: {
+    dir: [-1, 0.2, -0.32], sun: [1, 0.5, 0.22], sunI: 13,
+    sky: [1, 0.72, 0.62], skyI: 1.0, exposure: 1.05,
+    pane: [3.2, 1.6, 0.7], backdrop: [0.11, 0.08, 0.075],
+    lamps: { ceiling: false, floor: true, desk: true },
+  },
+  night: {
+    dir: [-0.5, 0.8, 0.2], sun: [0.55, 0.66, 1], sunI: 0.22,
+    sky: [0.4, 0.5, 1], skyI: 0.06, exposure: 1.15,
+    pane: [0.03, 0.05, 0.12], backdrop: [0.008, 0.009, 0.013],
+    lamps: { ceiling: true, floor: true, desk: true },
+  },
+};
+const backdrop = new THREE.Color();
+const state = { preset: 'day', lamps: { ...PRESETS.day.lamps } };
+
+function applyLights() {
+  const p = PRESETS[state.preset];
+  const dir = new THREE.Vector3(...p.dir).normalize();
+  sun.position.copy(sun.target.position).addScaledVector(dir, 14);
+  sun.color.copy(col(p.sun));
+  sun.intensity = p.sunI;
+  skyLight.color.copy(col(p.sky));
+  skyLight.intensity = p.skyI;
+  renderer.toneMappingExposure = p.exposure;
+
+  pane.material.color.copy(col(p.pane));
+  backdrop.copy(col(p.backdrop));
+
+  for (const group in fixtures) for (const l of fixtures[group]) l.intensity = state.lamps[group] ? l.userData.on : 0;
+  for (const e of emitters) e.mesh.material.emissiveIntensity = state.lamps[e.group] ? e.strength : 0;
+}
+
+/* ---------- indirect light: render the lit room into a cubemap, feed it back as ambient ---------- */
+const cubeTarget = new THREE.WebGLCubeRenderTarget(128, { type: THREE.HalfFloatType });
+const cubeCamera = new THREE.CubeCamera(0.05, 30, cubeTarget);
+cubeCamera.position.set(0, 1.4, 0);
+cubeCamera.children.forEach(c => c.layers.enable(CUTAWAY_LAYER));  // shadows and bounce use every wall
+const pmrem = new THREE.PMREMGenerator(renderer);
+let environment = null;
+
+function bakeBounce() {
+  renderer.shadowMap.needsUpdate = true;
+  pane.visible = false;
+  if (body) body.root.visible = false;
+  scene.background = null;
+  emitters.forEach(e => (e.mesh.visible = false));
+  scene.environment = null;
+  for (let bounce = 0; bounce < 2; bounce++) {
+    cubeCamera.update(renderer, scene);
+    const next = pmrem.fromCubemap(cubeTarget.texture);
+    scene.environment = next.texture;
+    environment?.dispose();
+    environment = next;
+  }
+  pane.visible = true;
+  if (body) body.root.visible = true;
+  scene.background = backdrop;
+  emitters.forEach(e => (e.mesh.visible = true));
+}
+
+/* ---------- post ---------- */
+const composerTarget = new THREE.WebGLRenderTarget(innerWidth * pixelRatio, innerHeight * pixelRatio, {
+  type: THREE.HalfFloatType, samples: 4,
+});
+const composer = new EffectComposer(renderer, composerTarget);
+composer.setPixelRatio(pixelRatio);
+composer.setSize(innerWidth, innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
+gtao.blendIntensity = 0.85;
+gtao.updateGtaoMaterial({ radius: 0.32, distanceExponent: 1.4, thickness: 1, scale: 1.1, samples: 16, distanceFallOff: 1, screenSpaceRadius: false });
+gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, radiusExponent: 2, rings: 2, samples: 16 });
+composer.addPass(gtao);
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.16, 0.7, 1.6));
+composer.addPass(new OutputPass());
+
+/* ---------- what can live in the room: a replayed episode or a plugin ---------- */
+if (location.protocol === 'file:') {
+  document.body.innerHTML = '<p style="color:#eee;font:16px system-ui;padding:24px">Run <code>python -m http.server</code> in the repo folder, then open <code>http://localhost:8000/world/</code></p>';
+  throw new Error('This page needs a local server.');
+}
+const room = await (await fetch('room.json')).json();
+
+// Anything placed in the room provides { root, update(dt), afterRender?() }. It stays out of the room's own lighting.
+let body = null;
+
+function createReplayBody({ dt, frames }) {
+  const root = new THREE.Group();
+  const puck = std(0xd9682f, 0.45);
+  cyl(0.2, 0.22, 0.14, 0, 0.07, 0, puck, { cast: false, parent: root });
+  box(0.06, 0.03, 0.16, 0, 0.155, 0.1, std(0xf4f1ea, 0.4), { cast: false, parent: root });
+  const duration = (frames.length - 1) * dt;
+  let time = 0;
+  return {
+    root,
+    update(delta) {
+      time = (time + delta) % duration;
+      const i = Math.min(Math.floor(time / dt), frames.length - 2), f = time / dt - i;
+      const a = frames[i], b = frames[i + 1];
+      root.position.set(a.x + (b.x - a.x) * f, 0, a.z + (b.z - a.z) * f);
+      root.rotation.y = a.heading + Math.atan2(Math.sin(b.heading - a.heading), Math.cos(b.heading - a.heading)) * f;
+      if (a.preset !== state.preset || Object.keys(a.lamps).some(name => a.lamps[name] !== state.lamps[name])) {
+        state.preset = a.preset;
+        state.lamps = { ...a.lamps };
+        refresh();
+      }
+      return true;
+    },
+  };
+}
+
+/* ---------- ui ---------- */
+let dirty = true;
+const presetButtons = [...document.querySelectorAll('[data-p]')];
+const lampBoxes = [...document.querySelectorAll('[data-l]')];
+
+function refresh() {
+  presetButtons.forEach(b => b.classList.toggle('on', b.dataset.p === state.preset));
+  lampBoxes.forEach(b => (b.checked = state.lamps[b.dataset.l]));
+  applyLights();
+  bakeBounce();
+  dirty = true;
+}
+function setPreset(name) {
+  state.preset = name;
+  state.lamps = { ...PRESETS[name].lamps };
+  refresh();
+}
+presetButtons.forEach(b => b.addEventListener('click', () => setPreset(b.dataset.p)));
+lampBoxes.forEach(b => b.addEventListener('change', () => { state.lamps[b.dataset.l] = b.checked; refresh(); }));
+
+/* ---------- orbit view, starting on a corner of the room ---------- */
+const canvas = renderer.domElement;
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0.95, 0);
+controls.enablePan = false;
+controls.enableDamping = true;
+controls.minDistance = 5;
+controls.maxDistance = 34;
+controls.maxPolarAngle = 1.48;
+const fit = Math.max(1, 1.5 / camera.aspect);
+camera.position.copy(controls.target).add(new THREE.Vector3(1, 0.86, 1).normalize().multiplyScalar(17 * fit));
+controls.addEventListener('change', () => (dirty = true));
+
+function updateCutaway() {
+  const p = camera.position;
+  const hidden = { ceiling: true, north: p.z < -2.5, south: p.z > 2.5, east: p.x > 3, west: p.x < -3 };
+  for (const wall in cutaway) for (const mesh of cutaway[wall]) mesh.layers.set(hidden[wall] ? CUTAWAY_LAYER : 0);
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  dirty = true;
+});
+
+/* ---------- loop: only redraw when something changed ---------- */
+let lastTick = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  controls.update();
+  const elapsed = (now - lastTick) / 1000;
+  if (body && elapsed >= 1 / 30) {          // anything in the room runs at 30 Hz; orbiting stays at full frame rate
+    lastTick = now;
+    if (body.update(Math.min(elapsed, 0.1))) dirty = true;
+  }
+  if (!dirty) return;
+  dirty = false;
+  updateCutaway();
+  body?.afterRender?.();
+  composer.render();
+}
+
+setPreset(PRESETS[location.hash.slice(1)] ? location.hash.slice(1) : 'day');
+
+const params = new URLSearchParams(location.search);
+if (params.get('replay')) {
+  body = createReplayBody(await (await fetch(params.get('replay'))).json());
+} else if (params.get('agent')) {
+  const url = new URL(params.get('agent'), location.href);
+  if (url.origin !== location.origin) throw new Error('Agent plugins must be served from this site.');
+  const plugin = await import(url.href);
+  body = await plugin.default({ THREE, RoundedBoxGeometry, scene, camera, room });
+}
+if (body) {
+  scene.add(body.root);
+  body.update(0);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
