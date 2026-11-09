@@ -6,6 +6,12 @@ A small, furnished 3D room with realistic lighting and a [Gymnasium](https://gym
 
 The repo contains the environment only. There is no bundled agent: you bring your own, whether that's reinforcement learning, a planner or an LLM.
 
+## Demo
+
+One room going from day to night. Click for the full video.
+
+<p align="center"><a href="docs/videos/room_short_clean.mp4"><img src="docs/videos/room_preview.gif" width="300" alt="The room moving from day to night"></a></p>
+
 ## Install
 
 Python 3.10 or newer.
