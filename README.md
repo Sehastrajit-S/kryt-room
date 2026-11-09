@@ -1,4 +1,4 @@
-# RoomWorld
+# kryt-room
 
 A small, furnished 3D room with realistic lighting and a [Gymnasium](https://gymnasium.farama.org) API. Train your own agents in a fast Python simulation of the room, then watch them in the 3D view.
 
@@ -11,8 +11,8 @@ The repo contains the environment only. There is no bundled agent: you bring you
 Python 3.10 or newer.
 
 ```bash
-git clone <this repo>
-cd <this repo>
+git clone https://github.com/Sehastrajit-S/kryt-room.git
+cd kryt-room
 pip install -e .
 ```
 

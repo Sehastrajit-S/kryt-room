@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "roomworld"
+name = "kryt-room"
 version = "0.1.0"
 description = "A lit 3D room where you can train your own agents, with a Gymnasium API."
 readme = "README.md"
